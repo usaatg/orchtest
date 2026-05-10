@@ -17,12 +17,18 @@ except Exception:  # pragma: no cover - lets non-LangGraph tests import package
             self.update = update or {}
             self.goto = goto
 
-from orchestrator_agents.agents import CodingAgent, ProblemStatementAgent, ResearchAgent, SmartFormBuilderAgent, WritingAgent
+from orchestrator_agents.agent_workflows import (
+    build_coding_agent_graph,
+    build_problem_statement_agent_graph,
+    build_research_agent_graph,
+    build_smart_form_builder_agent_graph,
+    build_writing_agent_graph,
+)
 from orchestrator_agents.graph.context import build_agent_task
 from orchestrator_agents.graph.state import OrchestratorState
 from orchestrator_agents.observability import make_event
 from orchestrator_agents.routing import RoutingService
-from orchestrator_agents.schemas import HandoffEvent, ImportedContext, RoutePlan, RouteVerification
+from orchestrator_agents.schemas import AgentResult, HandoffEvent, ImportedContext, RoutePlan, RouteVerification
 from orchestrator_agents.storage.artifact_store import JsonArtifactStore
 
 DestinationLiteral = Literal[
@@ -49,12 +55,14 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
 
     artifact_store = artifact_store or JsonArtifactStore()
     routing_service = RoutingService()
-    agents = {
-        "research_agent": ResearchAgent(),
-        "coding_agent": CodingAgent(),
-        "writing_agent": WritingAgent(),
-        "smart_form_builder_agent": SmartFormBuilderAgent(),
-        "problem_statement_agent": ProblemStatementAgent(),
+    # Each subagent is also a LangGraph workflow. Simple agents are one-node graphs;
+    # Smart Form Builder and Problem Statement agents are multi-node workflows.
+    subagent_graphs = {
+        "research_agent": build_research_agent_graph(artifact_store=artifact_store),
+        "coding_agent": build_coding_agent_graph(artifact_store=artifact_store),
+        "writing_agent": build_writing_agent_graph(artifact_store=artifact_store),
+        "smart_form_builder_agent": build_smart_form_builder_agent_graph(artifact_store=artifact_store),
+        "problem_statement_agent": build_problem_statement_agent_graph(artifact_store=artifact_store),
     }
 
     def initialize_node(state: OrchestratorState) -> dict:
@@ -201,10 +209,50 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
             goto=selected,
         )
 
+    def _invoke_subagent_workflow(agent_name: str, state: OrchestratorState, task) -> AgentResult:
+        """Invoke a subagent LangGraph workflow and normalize the output to AgentResult.
+
+        This adapter is what lets each subagent be called directly or as a subagent by
+        the orchestrator. The orchestrator owns top-level routing/thread state; the
+        subagent workflow owns its internal graph execution.
+        """
+
+        config = {"configurable": {"thread_id": state["thread_id"], "user_id": state["user_id"]}}
+
+        if agent_name == "smart_form_builder_agent":
+            graph_input = {
+                "user_message": state["user_query"],
+                "user_id": state["user_id"],
+                "thread_id": state["thread_id"],
+                "task_id": task.task_id,
+                "caller": "orchestrator",
+                "form_schema": task.context.get("form_schema"),
+                "form_state": task.context.get("form_state"),
+                "latest_form_artifact_id": task.context.get("latest_form_artifact_id"),
+            }
+        elif agent_name == "problem_statement_agent":
+            graph_input = {
+                "user_message": state["user_query"],
+                "user_id": state["user_id"],
+                "thread_id": state["thread_id"],
+                "task_id": task.task_id,
+                "caller": "orchestrator",
+                "form_artifact_id": task.context.get("latest_form_artifact_id") or task.context.get("form_artifact_id"),
+                "latest_problem_statement_artifact_id": task.context.get("latest_problem_statement_artifact_id"),
+                "update_reason": task.context.get("update_reason"),
+            }
+        else:
+            graph_input = {"task": task.model_dump()}
+
+        workflow_output = subagent_graphs[agent_name].invoke(graph_input, config=config)
+        if not workflow_output.get("agent_result"):
+            raise RuntimeError(f"Subagent workflow {agent_name} did not return agent_result")
+        return AgentResult.model_validate(workflow_output["agent_result"])
+
     def make_agent_node(agent_name: str):
         def _agent_node(state: OrchestratorState) -> dict:
             task = build_agent_task(agent_name, state)
-            result = agents[agent_name].invoke(task, artifact_store)
+            result = _invoke_subagent_workflow(agent_name, state, task)
             updates = {
                 "latest_agent_result": result.model_dump(),
                 "agent_results": [result.model_dump()],
@@ -218,7 +266,7 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
                 ],
                 "observability_events": [
                     make_event(
-                        event_type="subagent_completed",
+                        event_type="subagent_workflow_completed",
                         thread_id=state["thread_id"],
                         run_id=state["run_id"],
                         agent_id=agent_name,
@@ -226,7 +274,7 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
                         payload={
                             "confidence": result.confidence,
                             "artifact_ids": result.artifact_ids,
-                            "used_context_keys": result.metadata.get("used_context_keys", []),
+                            "workflow_graph": result.metadata.get("workflow_graph", agent_name),
                         },
                     )
                 ],

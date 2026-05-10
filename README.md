@@ -1,497 +1,532 @@
-# Orchestrator + Reusable Subagents Example v3
+# Orchestrator + LangGraph Subagent Workflows — v4
 
-This repository demonstrates a production-oriented LangGraph-style architecture for an **orchestrator agent** that routes user requests to reusable, stateless subagents while preserving multi-turn workflow state with a user-facing `thread_id`.
-
-Version 3 extends the v2.1 baseline with:
-
-- Direct-callable subagents that can also be called by the orchestrator.
-- A **Smart Form Builder Agent** that supports multi-turn form filling.
-- A **Problem Statement Agent** that consumes smart form artifacts.
-- Versioned artifacts, artifact lineage, and downstream dependency invalidation.
-- Sticky routing for active form workflows and dependency-resolution confirmations.
-- Tests for direct agent usage, routing, artifact dependency invalidation, and context packaging.
-
----
+This repository demonstrates a production-oriented **LangGraph orchestrator** that routes user requests to multiple **LangGraph subagent workflows**. The design is intended for teams building agentic systems where a central orchestrator controls routing, session state, artifact lineage, dependency invalidation, and final user-facing responses, while specialized agents can also be used independently.
 
 ## Audience
 
 This README is written for three audiences:
 
-- **Product managers** who need to understand the user/workflow behavior.
-- **Architects** who need to understand state, routing, dependencies, and extensibility.
-- **Developers** who need to run, test, and extend the codebase.
+- **Product managers** who need to understand capabilities, user flows, and product behavior.
+- **Architects** who need to understand the system boundaries, state model, dependency model, and production scaling considerations.
+- **Developers** who need to run, test, extend, and integrate the code.
 
 ---
 
-## Product-Level Summary
+## What changed in v4
 
-The system has one user-facing orchestrator that receives all user messages. The orchestrator decides which specialist subagent should handle the request.
+v4 upgrades the v3 design so that the orchestrator and every subagent are represented as **LangGraph workflows**.
 
-Current subagents:
+The repo now includes:
 
-1. `research_agent`
-2. `coding_agent`
-3. `writing_agent`
-4. `smart_form_builder_agent`
-5. `problem_statement_agent`
+- `orchestrator_graph`: top-level user-facing workflow.
+- `research_agent_graph`: direct/subagent-callable LangGraph workflow.
+- `coding_agent_graph`: direct/subagent-callable LangGraph workflow.
+- `writing_agent_graph`: direct/subagent-callable LangGraph workflow.
+- `smart_form_builder_agent_graph`: multi-node LangGraph workflow for multi-turn form filling.
+- `problem_statement_agent_graph`: multi-node LangGraph workflow that consumes smart form artifacts and produces problem statement artifacts.
 
-The most important v3 scenario is:
-
-```text
-User wants to define a business problem
-  ↓
-Orchestrator routes to Smart Form Builder Agent
-  ↓
-Smart Form Builder collects structured fields over multiple turns
-  ↓
-Completed smart form is saved as a versioned artifact
-  ↓
-Problem Statement Agent consumes latest form artifact
-  ↓
-Problem statement is saved as a versioned artifact that depends on the form artifact
-  ↓
-If form is later updated, orchestrator marks dependent problem statement stale
-  ↓
-Orchestrator asks whether user wants to regenerate/update the problem statement
-```
-
-This enables a more realistic multi-agent product workflow where downstream outputs know which upstream data they were generated from.
+The important architectural rule is that subagents are **not coupled to the orchestrator state schema**. They expose clean input/output contracts, and the orchestrator uses adapter logic to call them.
 
 ---
 
-## Key Design Principles
+## Core product scenario
 
-### 1. One user-facing workflow thread
-
-A UI application should generally create one stable `thread_id` per workflow session.
+A user can interact with an orchestrated workflow like this:
 
 ```text
-Same workflow/session = same thread_id
-New independent workflow/session = new thread_id
+User: I want to define a business problem.
+  ↓
+Orchestrator routes to Smart Form Builder Agent Graph.
+  ↓
+Smart Form Builder asks structured questions across multiple turns.
+  ↓
+Completed smart form is saved as a versioned artifact.
+  ↓
+Orchestrator routes to Problem Statement Agent Graph.
+  ↓
+Problem Statement Agent generates a problem statement from the latest form artifact.
+  ↓
+Problem statement artifact depends_on the form artifact.
 ```
 
-The `thread_id` belongs to the orchestrator workflow, not to individual subagents.
+Later:
 
-### 2. Subagents are stateless by default
-
-Subagents should not own hidden mutable conversation state. They receive explicit input and return explicit output.
-
-Generic subagent contract:
-
-```python
-AgentTask -> AgentResult
+```text
+User: Actually, update the stakeholder field in the form.
+  ↓
+Smart Form Builder updates the form and creates form v2.
+  ↓
+Dependency checker sees problem_statement v1 depends_on form v1.
+  ↓
+Problem statement is marked stale.
+  ↓
+Orchestrator asks whether the user wants the problem statement updated.
+  ↓
+If yes, Problem Statement Agent regenerates statement from form v2.
 ```
 
-Smart form direct contract:
+This pattern generalizes to any future chain of dependent artifacts:
 
-```python
-FormAgentInput -> FormAgentOutput
+```text
+smart form → problem statement → solution design → implementation plan → executive summary
 ```
 
-Problem statement direct contract:
+---
 
-```python
-ProblemStatementInput -> ProblemStatementOutput
+## High-level architecture
+
+```text
+UI / API
+  ↓
+Orchestrator LangGraph Workflow
+  ├── routing service
+  ├── route policy gate
+  ├── handoff tracking
+  ├── sticky workflow routing
+  ├── dependency resolution
+  ├── artifact lineage
+  └── finalizer
+       ↓
+       ├── Research Agent LangGraph Workflow
+       ├── Coding Agent LangGraph Workflow
+       ├── Writing Agent LangGraph Workflow
+       ├── Smart Form Builder Agent LangGraph Workflow
+       └── Problem Statement Agent LangGraph Workflow
 ```
 
-This makes subagents reusable as:
+Each subagent graph can be used in two ways:
 
-- direct agents called by a UI/API, or
-- orchestrator-managed subagents inside a larger workflow.
+```text
+Direct mode:
+  UI/API → subagent graph
 
-### 3. Orchestrator owns workflow state
+Orchestrated mode:
+  UI/API → orchestrator graph → subagent graph → orchestrator/finalizer
+```
 
-The orchestrator state owns:
+---
+
+## Repository structure
+
+```text
+orchestrator-subagents-example-v4/
+  pyproject.toml
+  README.md
+  .env.example
+  src/orchestrator_agents/
+    agent_workflows/
+      __init__.py
+      _langgraph.py
+      basic.py
+      smart_form.py
+      problem_statement.py
+    agents/
+      base.py
+      research.py
+      coding.py
+      writing.py
+      smart_form.py
+      problem_statement.py
+    graph/
+      build.py
+      context.py
+      state.py
+    routing/
+      deterministic.py
+      llm_router.py
+      policy.py
+      service.py
+      verifier.py
+    storage/
+      artifact_store.py
+      memory_store.py
+    dependencies.py
+    observability.py
+    registry.py
+    schemas.py
+    cli.py
+  tests/
+    routing_cases/
+    test_*.py
+```
+
+### Important folders
+
+#### `agent_workflows/`
+
+Contains the LangGraph workflows for subagents.
+
+- `basic.py` builds one-node workflows for research/coding/writing.
+- `smart_form.py` builds the Smart Form Builder LangGraph workflow.
+- `problem_statement.py` builds the Problem Statement LangGraph workflow.
+
+#### `agents/`
+
+Contains reusable stateless agent logic. These classes still exist because they are useful as the internal business logic inside the subagent graphs.
+
+Example:
+
+```text
+SmartFormBuilderAgent.run(FormAgentInput) -> FormAgentOutput
+```
+
+The graph wraps this service with workflow steps like normalization, validation, artifact persistence, and output normalization.
+
+#### `graph/`
+
+Contains the top-level orchestrator LangGraph workflow.
+
+The orchestrator is responsible for:
+
+- routing
+- sticky workflow continuation
+- invoking subagent graphs
+- recording handoffs
+- collecting outputs
+- managing dependency resolution
+- producing final answers
+
+#### `storage/`
+
+Contains local JSON-backed stores for demo purposes.
+
+- `ArtifactStore`: stores generated outputs, completed forms, problem statements, etc.
+- `MemoryStore`: stores durable reusable memory separate from workflow state.
+
+For production, replace these with a durable backend.
+
+---
+
+## Key design principles
+
+### 1. Orchestrator owns top-level control
+
+The orchestrator owns:
 
 - `thread_id`
-- `run_id`
-- `active_workflow`
-- `route_plan`
-- `handoff_history`
-- `latest_form_artifact_id`
-- `latest_problem_statement_artifact_id`
-- `pending_dependency_action`
-- `stale_artifact_ids`
+- route decisions
+- route plans
+- handoff history
+- active workflow state
+- artifact lineage
+- dependency invalidation
+- user-facing final answers
 
-### 4. Artifact store owns durable outputs
+Subagents do not directly decide the overall user workflow.
 
-Large or durable outputs should be stored as artifacts. Graph state should store IDs and short summaries, not entire long outputs.
+### 2. Subagents are LangGraph workflows
 
-Examples:
+Each subagent is now a graph boundary. This allows subagents to have their own internal steps while remaining reusable.
 
-- completed smart form
-- generated problem statement
-- research summary
-- coding plan
-- writing output
-
-### 5. Dependencies are tracked through artifact lineage
-
-A problem statement artifact records that it depends on a specific form artifact version.
-
-If the form artifact is superseded, the orchestrator can detect that the problem statement is stale.
-
----
-
-## Repository Structure
+For simple agents, the workflow may be a one-node graph:
 
 ```text
-src/orchestrator_agents/
-  agents/
-    base.py
-    coding.py
-    research.py
-    writing.py
-    smart_form.py
-    problem_statement.py
-  graph/
-    build.py
-    context.py
-    state.py
-  routing/
-    deterministic.py
-    llm_router.py
-    policy.py
-    service.py
-    verifier.py
-  storage/
-    artifact_store.py
-    memory_store.py
-  dependencies.py
-  observability.py
-  registry.py
-  schemas.py
-  cli.py
-
-tests/
-  test_artifact_memory.py
-  test_context_packaging.py
-  test_form_and_problem_agents.py
-  test_graph_multiturn.py
-  test_routing.py
-  test_routing_form_problem_dependency.py
+START → invoke_agent → END
 ```
 
----
-
-## Core Runtime Concepts
-
-### `thread_id`
-
-Identifies the user-facing workflow session. Reuse the same `thread_id` for multi-turn continuity.
-
-### `run_id`
-
-Identifies one graph invocation/turn.
-
-### `handoff_id`
-
-Identifies one delegation event from the orchestrator to a subagent.
-
-### `task_id`
-
-Identifies one route-plan step/subtask.
-
-### `artifact_id`
-
-Identifies a persisted output, such as a completed form or problem statement.
-
----
-
-## Smart Form Builder Agent
-
-The smart form agent is both:
-
-1. a direct-callable agent, and
-2. an orchestrator-callable subagent.
-
-### Direct usage
-
-```python
-from orchestrator_agents.agents import DEFAULT_PROBLEM_FORM_SCHEMA, SmartFormBuilderAgent
-from orchestrator_agents.schemas import FormAgentInput
-
-agent = SmartFormBuilderAgent()
-form_state = None
-
-output = agent.run(
-    FormAgentInput(
-        user_message="I want to define a problem",
-        form_schema=DEFAULT_PROBLEM_FORM_SCHEMA,
-        form_state=form_state,
-    )
-)
-
-form_state = output.updated_form_state
-print(output.assistant_message)
-```
-
-The caller owns and persists `form_state` in direct mode.
-
-### Orchestrator usage
-
-The orchestrator converts `OrchestratorState` into an `AgentTask`; the smart form agent returns an `AgentResult` containing the updated `form_state` inside `metadata`.
-
-While the form is active, the orchestrator sets:
-
-```python
-active_workflow = "form_fill"
-```
-
-This enables sticky routing so messages like `Mike Jones` or `Plant managers` go back to the form agent instead of being misclassified.
-
----
-
-## Problem Statement Agent
-
-The problem statement agent consumes the latest smart form artifact.
-
-Direct contract:
-
-```python
-ProblemStatementInput -> ProblemStatementOutput
-```
-
-Orchestrated contract:
-
-```python
-AgentTask -> AgentResult
-```
-
-When called by the orchestrator, it expects:
-
-```python
-latest_form_artifact_id
-```
-
-It loads that artifact from `JsonArtifactStore`, generates a problem statement, and saves a new `problem_statement` artifact.
-
-The new problem statement artifact records:
-
-```python
-depends_on = [form_artifact]
-```
-
----
-
-## Artifact Lineage and Dependency Handling
-
-The v3 codebase adds artifact lineage.
-
-### Example
+For complex agents, the workflow has multiple nodes:
 
 ```text
-form_v1
-  ↓
-problem_statement_v1 depends_on form_v1
+Smart Form Builder:
+START → normalize → run_form_logic → persist_artifact → END
+
+Problem Statement:
+START → load_form_artifact → draft_statement → persist_problem_statement → END
 ```
 
-If the form is updated:
+### 3. Subagents are still stateless from the caller's perspective
+
+A subagent graph can have internal workflow state during invocation, but it should not hide durable state from the orchestrator.
+
+The caller provides the current context:
 
 ```text
-form_v2 supersedes form_v1
+FormGraphInput includes current form state.
+ProblemStatementGraphInput includes form artifact ID.
 ```
 
-The dependency checker finds downstream artifacts that depend on `form_v1` and marks them stale:
+The subagent returns structured output:
 
 ```text
-problem_statement_v1.status = stale
+AgentResult
+artifact IDs
+assistant message
+metadata
 ```
 
-Then the orchestrator creates a pending dependency action:
+### 4. State, memory, and artifacts are different
+
+```text
+Graph state:
+  Active workflow state needed to continue execution.
+
+Artifact store:
+  Versioned durable outputs such as completed forms and problem statements.
+
+Memory store:
+  Durable reusable knowledge/preferences across workflows.
+```
+
+### 5. Versioned artifacts manage dependency correctness
+
+Problem statement artifacts depend on form artifacts.
+
+When a form artifact is superseded, downstream artifacts that depend on the old form can be marked stale.
+
+---
+
+## Thread IDs and multi-turn behavior
+
+A UI application should normally use:
+
+```text
+one user-facing workflow session = one thread_id
+```
+
+For example:
 
 ```python
-pending_dependency_action = {
-    "type": "offer_regenerate_problem_statement",
-    "stale_artifact_ids": [...],
-    "reason": "Form artifact changed; dependent problem statement may be stale.",
+config = {
+    "configurable": {
+        "thread_id": "workflow_session_123",
+        "user_id": "user_456",
+    }
 }
 ```
 
-The user is asked:
+Use the same `thread_id` when the user is continuing the same workflow. Use a new `thread_id` when the user starts a new independent workflow.
+
+### Sticky routing
+
+If a user is in the middle of filling out a form, the orchestrator should route follow-up responses back to the smart form builder, even if the response looks ambiguous.
+
+Example:
+
+```text
+Smart Form Builder: What is the stakeholder?
+User: Plant managers
+```
+
+The orchestrator should not classify `Plant managers` as a random general message. It should know this is part of the active form workflow.
+
+---
+
+## Direct subagent usage
+
+### Direct Smart Form Builder workflow
+
+```python
+from orchestrator_agents.agent_workflows import build_smart_form_builder_agent_graph
+from orchestrator_agents.agents.smart_form import DEFAULT_PROBLEM_FORM_SCHEMA
+
+form_graph = build_smart_form_builder_agent_graph()
+
+result = form_graph.invoke(
+    {
+        "user_message": "I want to fill out the problem discovery form.",
+        "user_id": "user_1",
+        "thread_id": "form_session_1",
+        "form_schema": DEFAULT_PROBLEM_FORM_SCHEMA.model_dump(),
+        "form_state": None,
+    },
+    config={"configurable": {"thread_id": "form_session_1"}},
+)
+
+print(result["final_answer"])
+form_state = result["form_output"]["updated_form_state"]
+```
+
+On the next direct turn:
+
+```python
+result = form_graph.invoke(
+    {
+        "user_message": "Operations managers",
+        "user_id": "user_1",
+        "thread_id": "form_session_1",
+        "form_schema": DEFAULT_PROBLEM_FORM_SCHEMA.model_dump(),
+        "form_state": form_state,
+    },
+    config={"configurable": {"thread_id": "form_session_1"}},
+)
+```
+
+### Direct Problem Statement workflow
+
+```python
+from orchestrator_agents.agent_workflows import build_problem_statement_agent_graph
+
+problem_graph = build_problem_statement_agent_graph(artifact_store=artifact_store)
+
+result = problem_graph.invoke(
+    {
+        "user_message": "Generate the problem statement.",
+        "user_id": "user_1",
+        "thread_id": "problem_session_1",
+        "form_artifact_id": "artifact_form_v1",
+    },
+    config={"configurable": {"thread_id": "problem_session_1"}},
+)
+
+print(result["final_answer"])
+```
+
+---
+
+## Orchestrated subagent usage
+
+The orchestrator converts its own state into each subagent graph's public input contract.
+
+```text
+OrchestratorState
+  ↓ adapter
+SmartFormWorkflowState
+  ↓ smart form graph
+AgentResult
+  ↓ adapter
+OrchestratorState update
+```
+
+The adapter logic lives in `graph/build.py`.
+
+This design allows each subagent workflow to be invoked directly or through the orchestrator without changing the agent internals.
+
+---
+
+## Artifact dependency handling
+
+The dependency model is based on versioned artifacts.
+
+### Form artifact
+
+```text
+artifact_type = smart_form
+version = 1
+status = current
+```
+
+### Problem statement artifact
+
+```text
+artifact_type = problem_statement
+depends_on = [form artifact v1]
+```
+
+### When the form is updated
+
+```text
+form_v2 supersedes form_v1
+problem_statement_v1 depends_on form_v1
+problem_statement_v1 becomes stale
+```
+
+The orchestrator asks:
 
 ```text
 I updated the form. Your current problem statement was generated from the previous form version, so it may no longer be accurate. Would you like me to update the problem statement too?
 ```
 
-If the user says `yes`, sticky dependency routing sends the next turn to `problem_statement_agent`.
+If the user says yes, sticky dependency-resolution routing sends the user to the Problem Statement Agent workflow.
 
 ---
 
-## Routing Pipeline
-
-Routing is handled by `RoutingService`.
-
-```text
-deterministic router
-  ↓
-LLM router placeholder if deterministic router cannot decide
-  ↓
-route verifier
-  ↓
-policy gate
-  ↓
-Command(goto=selected_agent)
-```
-
-The current implementation uses high-precision deterministic routing and a mock LLM router placeholder.
-
-Production replacement:
-
-```python
-router_llm.with_structured_output(RoutePlan).invoke(...)
-```
-
-### Sticky routing
-
-Before normal intent classification, the router checks active workflow state:
-
-- `active_workflow == "form_fill"`
-- `active_workflow == "dependency_resolution"`
-
-This prevents short follow-up answers from being routed incorrectly.
-
----
-
-## Graph Handoff Pattern
-
-The orchestrator uses `Command(goto=...)` for dynamic routing.
-
-Conceptually:
-
-```text
-START
-  ↓
-initialize
-  ↓
-import_context
-  ↓
-route
-  ↓
-route_policy
-  ├── research_agent
-  ├── coding_agent
-  ├── writing_agent
-  ├── smart_form_builder_agent
-  ├── problem_statement_agent
-  ├── clarification_node
-  └── fallback_agent
-```
-
-After a subagent runs, its result goes back to the graph through shared state. The finalizer or route-plan executor decides what happens next.
-
-The subagent does **not** own the user-facing interaction.
-
----
-
-## Dynamic Graph Visualization Note
-
-Because runtime handoffs use `Command(goto=...)`, visual graph renderers may show some nodes as disconnected or may not show all runtime edges. That does not necessarily mean the graph is wrong.
-
-Static edges show graph structure. `Command(goto=...)` represents runtime routing.
-
----
-
-## Memory vs State vs Artifacts
-
-### Graph state
-
-Active workflow working memory:
-
-- active form state
-- route plan
-- pending dependency action
-- selected agent
-- current step index
-
-### Artifact store
-
-Durable outputs:
-
-- completed form
-- problem statement
-- research summary
-- code plan
-
-### Memory store
-
-Long-term user/project/agent knowledge. The demo includes a simple JSON-backed memory store; production should use a durable database/vector/document store as appropriate.
-
----
-
-## Running Locally
+## Running locally
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+```
+
+Run the CLI demo:
+
+```bash
+orchestrator-demo
+```
+
+Run tests:
+
+```bash
 pytest -q
 ```
 
-Expected test result in the build environment:
+Compile check:
 
-```text
-15 passed, 2 skipped
+```bash
+python -m compileall -q src tests
 ```
-
-The skipped tests are LangGraph runtime tests that only run when `langgraph` is installed.
 
 ---
 
-## Production Notes
+## Persistence guidance
 
-Before production use, replace or extend:
+This repo uses local/demo storage by default.
 
-1. `JsonArtifactStore` with Postgres/blob/document storage.
-2. `JsonMemoryStore` with durable user/project memory.
-3. mock `llm_route_plan()` with a real structured-output LLM router.
-4. observability state events with LangSmith/OpenTelemetry/log backend events.
-5. demo checkpointer with a durable LangGraph checkpointer.
-6. simple form extraction with more robust field extraction/validation.
-7. stringified artifact content with JSON-native serialization.
+For production:
 
----
-
-## Recommended Product Behavior
-
-When form data changes after a problem statement exists, do not silently regenerate everything.
-
-Recommended default:
-
-```text
-Update form
-Mark dependent problem statement stale
-Ask user whether to update problem statement
-If yes, regenerate from latest form
-If no, keep stale artifact and show status when relevant
-```
-
-This gives users control and preserves artifact lineage.
+- Use a durable LangGraph checkpointer, such as Postgres or another supported backend.
+- Replace JSON artifact/memory stores with durable storage.
+- Add authentication/authorization around artifact reads and cross-thread references.
+- Add structured logging/OpenTelemetry/LangSmith tracing.
+- Add retention policies for artifacts and workflow state.
 
 ---
 
-## Extension Pattern
+## Graph visualization note
 
-To add another dependent subagent, such as `solution_design_agent`:
+The orchestrator uses `Command(goto=...)` for dynamic routing. Some graph renderers may not show every possible runtime handoff as a static edge.
 
-1. Add an `AgentSpec` to `registry.py`.
-2. Implement direct and orchestrated contracts.
-3. Save outputs as artifacts.
-4. Add `depends_on` references to source artifacts.
-5. Add routing rules.
-6. Add dependency invalidation behavior if source artifacts change.
-7. Add tests for direct usage, routing, and dependency stale behavior.
+This is expected.
 
-This lets the architecture scale from two dependent agents to a full graph of generated deliverables:
+A graph may visually show nodes that look disconnected even though the orchestrator can route to them at runtime. Type hints and route metadata help document valid destinations.
+
+---
+
+## Testing strategy
+
+The test suite covers:
+
+- deterministic routing
+- ambiguous/fallback routing
+- artifact and memory separation
+- context packaging
+- direct smart form behavior
+- direct problem statement behavior
+- dependency invalidation
+- dependency resolution routing
+- importability/compilation without requiring LangGraph runtime in non-LangGraph environments
+
+Some LangGraph runtime tests are skipped if LangGraph is not installed.
+
+---
+
+## Production extension points
+
+Useful next upgrades:
+
+1. Replace mocked LLM router with structured-output LLM routing.
+2. Add a real route verifier model.
+3. Add OpenTelemetry/LangSmith tracing.
+4. Add durable artifact storage.
+5. Add user/project permissions for cross-thread artifact references.
+6. Add human approval before final form submission.
+7. Add downstream agents such as solution design, implementation plan, ROI analysis, and executive summary.
+8. Add parallel fan-out/fan-in workflows for agents that can process independent subtasks.
+
+---
+
+## Summary
+
+v4 demonstrates the recommended pattern for complex orchestrated agent systems:
 
 ```text
-smart_form
-  ↓
-problem_statement
-  ↓
-solution_design
-  ↓
-implementation_plan
-  ↓
-executive_summary
+Orchestrator = top-level LangGraph control plane
+Subagents = reusable LangGraph workflows
+Agents = direct-callable and orchestrator-callable
+Artifacts = versioned durable outputs
+Dependencies = explicit lineage between artifacts
+State = active workflow context
+Memory = reusable long-term knowledge
 ```
+
+This lets you build multi-turn, multi-agent workflows that are inspectable, reusable, dependency-aware, and production-oriented.
