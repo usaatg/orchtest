@@ -1,7 +1,7 @@
 [project]
 name = "orchestrator-subagents-example"
-version = "0.2.1"
-description = "Production-oriented LangGraph orchestrator with route plans, stateless subagents, thread checkpoints, memory, artifacts, and routing tests."
+version = "0.3.0"
+description = "Production-oriented LangGraph orchestrator with reusable stateless subagents, smart form building, problem statements, artifact lineage, dependencies, memory, and routing tests."
 requires-python = ">=3.11"
 dependencies = [
   "langgraph>=0.2.60",

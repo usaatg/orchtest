@@ -34,9 +34,15 @@ def main() -> None:
     config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
 
     turns = [
-        "Find the latest LangGraph handoff docs and build a Python routing example",
-        "Rewrite that explanation clearly for a technical stakeholder",
-        "Can you help with this thing?",
+        "I want to define a business problem statement",
+        "Plant managers",
+        "Manual daily reporting is slow",
+        "Automated KPI summaries",
+        "Delayed operational decisions",
+        "yes",
+        "Create the problem statement from my form",
+        "Actually, stakeholder should be operations managers",
+        "yes",
     ]
 
     state = None

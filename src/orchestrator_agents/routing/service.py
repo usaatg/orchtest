@@ -78,7 +78,7 @@ class RoutingService:
     def decide_plan(
         self, user_query: str, *, state: Mapping[str, Any] | None = None
     ) -> tuple[RoutePlan, RouteVerification, Destination, str]:
-        plan = deterministic_route_plan(user_query) or llm_route_plan(user_query)
+        plan = deterministic_route_plan(user_query, state=dict(state or {})) or llm_route_plan(user_query)
         plan = self._apply_required_input_validation(plan, state or {"user_query": user_query})
         verification = verify_route_plan(plan)
         destination, policy_reason = apply_route_plan_policy(plan, verification)

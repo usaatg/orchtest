@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - lets non-LangGraph tests import package
             self.update = update or {}
             self.goto = goto
 
-from orchestrator_agents.agents import CodingAgent, ResearchAgent, WritingAgent
+from orchestrator_agents.agents import CodingAgent, ProblemStatementAgent, ResearchAgent, SmartFormBuilderAgent, WritingAgent
 from orchestrator_agents.graph.context import build_agent_task
 from orchestrator_agents.graph.state import OrchestratorState
 from orchestrator_agents.observability import make_event
@@ -29,6 +29,8 @@ DestinationLiteral = Literal[
     "research_agent",
     "coding_agent",
     "writing_agent",
+    "smart_form_builder_agent",
+    "problem_statement_agent",
     "clarification_node",
     "fallback_agent",
     "finalizer",
@@ -51,6 +53,8 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
         "research_agent": ResearchAgent(),
         "coding_agent": CodingAgent(),
         "writing_agent": WritingAgent(),
+        "smart_form_builder_agent": SmartFormBuilderAgent(),
+        "problem_statement_agent": ProblemStatementAgent(),
     }
 
     def initialize_node(state: OrchestratorState) -> dict:
@@ -201,7 +205,7 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
         def _agent_node(state: OrchestratorState) -> dict:
             task = build_agent_task(agent_name, state)
             result = agents[agent_name].invoke(task, artifact_store)
-            return {
+            updates = {
                 "latest_agent_result": result.model_dump(),
                 "agent_results": [result.model_dump()],
                 "artifact_ids": result.artifact_ids,
@@ -227,6 +231,40 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
                     )
                 ],
             }
+            if agent_name == "smart_form_builder_agent":
+                form_state = result.metadata.get("form_state")
+                if form_state:
+                    updates["active_form_state"] = form_state
+                    if form_state.get("status") in {"in_progress", "ready_for_review"}:
+                        updates["active_workflow"] = "form_fill"
+                        updates["final_answer"] = result.result
+                    elif form_state.get("status") in {"completed", "cancelled"}:
+                        updates["active_workflow"] = None
+                if result.metadata.get("latest_form_artifact_id"):
+                    updates["latest_form_artifact_id"] = result.metadata["latest_form_artifact_id"]
+                stale_ids = result.metadata.get("stale_artifact_ids", [])
+                dependency_events = result.metadata.get("dependency_events", [])
+                if stale_ids:
+                    updates["stale_artifact_ids"] = stale_ids
+                    updates["dependency_events"] = dependency_events
+                    updates["active_workflow"] = "dependency_resolution"
+                    updates["pending_dependency_action"] = {
+                        "type": "offer_regenerate_problem_statement",
+                        "stale_artifact_ids": stale_ids,
+                        "reason": "Form artifact changed; dependent problem statement may be stale.",
+                    }
+                    updates["final_answer"] = (
+                        "I updated the form. Your current problem statement was generated from the previous "
+                        "form version, so it may no longer be accurate. Would you like me to update the problem statement too?"
+                    )
+            if agent_name == "problem_statement_agent":
+                latest_id = result.metadata.get("latest_problem_statement_artifact_id")
+                if latest_id:
+                    updates["latest_problem_statement_artifact_id"] = latest_id
+                updates["active_workflow"] = None
+                updates["pending_dependency_action"] = None
+                updates["final_answer"] = result.result
+            return updates
 
         return _agent_node
 
@@ -325,6 +363,8 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
     builder.add_node("research_agent", make_agent_node("research_agent"))
     builder.add_node("coding_agent", make_agent_node("coding_agent"))
     builder.add_node("writing_agent", make_agent_node("writing_agent"))
+    builder.add_node("smart_form_builder_agent", make_agent_node("smart_form_builder_agent"))
+    builder.add_node("problem_statement_agent", make_agent_node("problem_statement_agent"))
     builder.add_node("next_step", next_step_node)
     builder.add_node("clarification_node", clarification_node)
     builder.add_node("fallback_agent", fallback_agent)
@@ -338,6 +378,8 @@ def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactS
     builder.add_edge("research_agent", "next_step")
     builder.add_edge("coding_agent", "next_step")
     builder.add_edge("writing_agent", "next_step")
+    builder.add_edge("smart_form_builder_agent", "next_step")
+    builder.add_edge("problem_statement_agent", "next_step")
     builder.add_edge("fallback_agent", "finalizer")
     builder.add_edge("clarification_node", END)
     builder.add_edge("finalizer", END)
