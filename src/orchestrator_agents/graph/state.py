@@ -1,29 +1,39 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, TypedDict
-from typing_extensions import NotRequired
+from typing import Annotated, Any
+from typing_extensions import NotRequired, TypedDict
 
 
 class OrchestratorState(TypedDict):
-    # Input for the current turn. With a checkpointer and stable thread_id, prior
-    # state is retained while each turn adds a new user_query/messages entry.
+    # User/session identity
     user_query: str
     user_id: str
     thread_id: str
-
-    # Multi-turn transcript and event logs. Reducers append rather than replace.
-    messages: Annotated[list[dict], operator.add]
-    route_history: Annotated[list[dict], operator.add]
-    handoff_history: Annotated[list[dict], operator.add]
-    artifact_ids: Annotated[list[str], operator.add]
-
-    # Current turn routing/execution data.
     run_id: NotRequired[str]
-    current_agent: NotRequired[str]
+
+    # Cross-thread/artifact references
+    referenced_thread_ids: NotRequired[list[str]]
+    referenced_artifact_ids: NotRequired[list[str]]
+    imported_context: Annotated[list[dict[str, Any]], operator.add]
+
+    # Routing
+    normalized_query: NotRequired[str]
+    route_plan: NotRequired[dict[str, Any]]
+    route_verification: NotRequired[dict[str, Any]]
+    route_policy_reason: NotRequired[str]
     selected_agent: NotRequired[str]
-    route_decision: NotRequired[dict]
-    route_verification: NotRequired[dict]
-    agent_result: NotRequired[str]
+    current_agent: NotRequired[str]
+    current_route_step_index: NotRequired[int]
+
+    # Histories and telemetry
+    messages: Annotated[list[dict[str, Any]], operator.add]
+    route_history: Annotated[list[dict[str, Any]], operator.add]
+    handoff_history: Annotated[list[dict[str, Any]], operator.add]
+    observability_events: Annotated[list[dict[str, Any]], operator.add]
+
+    # Artifacts/results
+    artifact_ids: Annotated[list[str], operator.add]
+    latest_agent_result: NotRequired[dict[str, Any]]
+    agent_results: Annotated[list[dict[str, Any]], operator.add]
     final_answer: NotRequired[str]
-    clarification_question: NotRequired[str]

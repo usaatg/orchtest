@@ -1,42 +1,53 @@
 from __future__ import annotations
 
 from orchestrator_agents.registry import AGENT_REGISTRY
-from orchestrator_agents.schemas import RouteDecision, RouteVerification
+from orchestrator_agents.schemas import RoutePlan, RouteVerification
 
 
-def verify_route(decision: RouteDecision) -> RouteVerification:
-    """Deterministic verification layer for route safety.
+def verify_route_plan(plan: RoutePlan) -> RouteVerification:
+    """Deterministic verification layer. Add LLM verifier in production if needed."""
 
-    In production you can add an LLM verifier here, but deterministic checks should
-    remain because they are easier to test and reason about.
-    """
-
-    if decision.target_agent in {"clarification_node", "fallback_agent"}:
+    if plan.mode in {"clarification", "fallback"}:
         return RouteVerification(
             approved=True,
             confidence=1.0,
-            reason="Non-specialist destination is always allowed.",
+            reason=f"Control mode {plan.mode} is allowed.",
         )
 
-    spec = AGENT_REGISTRY.get(decision.target_agent)
-    if spec is None:
+    if not plan.steps:
         return RouteVerification(
             approved=False,
             corrected_destination="fallback_agent",
             confidence=1.0,
-            reason="Target agent is not registered.",
+            reason="Executable route plan has no steps.",
         )
 
-    if not spec.enabled:
-        return RouteVerification(
-            approved=False,
-            corrected_destination="fallback_agent",
-            confidence=1.0,
-            reason="Target agent is disabled.",
-        )
+    for step in plan.steps:
+        spec = AGENT_REGISTRY.get(step.agent)
+        if spec is None:
+            return RouteVerification(
+                approved=False,
+                corrected_destination="fallback_agent",
+                confidence=1.0,
+                reason=f"Step agent {step.agent} is not registered.",
+            )
+        if not spec.enabled:
+            return RouteVerification(
+                approved=False,
+                corrected_destination="fallback_agent",
+                confidence=1.0,
+                reason=f"Step agent {step.agent} is disabled.",
+            )
 
     return RouteVerification(
         approved=True,
         confidence=0.95,
-        reason=f"Target agent {decision.target_agent} is registered and enabled.",
+        reason="All route plan steps reference registered enabled agents.",
     )
+
+
+# Backward-compatible alias.
+def verify_route(decision):
+    from orchestrator_agents.routing.service import decision_to_route_plan
+
+    return verify_route_plan(decision_to_route_plan(decision))

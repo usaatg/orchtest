@@ -11,20 +11,24 @@ class WritingAgent(StatelessSubAgent):
     def invoke(self, task: AgentTask, artifact_store: JsonArtifactStore) -> AgentResult:
         result = (
             "Polished response draft:\n"
-            f"{task.user_query}\n\n"
-            "Suggested style: clear, concise, and audience-aware."
+            f"Original request: {task.user_query}\n\n"
+            f"Instruction: {task.instruction}\n\n"
+            "Draft: Clear, concise, audience-aware language with explicit next steps."
         )
         artifact_id = artifact_store.put(
             user_id=task.context["user_id"],
-            thread_id=task.context["thread_id"],
+            namespace=("threads", task.context["thread_id"], "artifacts"),
             artifact_type="writing_draft",
             content=result,
+            summary=result[:300],
             metadata={"created_by": self.name, "task_id": task.task_id},
+            source_thread_id=task.context["thread_id"],
         )
         return AgentResult(
             task_id=task.task_id,
             agent_name="writing_agent",
             result=result,
+            result_summary="Writing draft artifact created.",
             confidence=0.86,
             artifact_ids=[artifact_id],
             metadata={"used_context_keys": sorted(task.context.keys())},

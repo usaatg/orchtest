@@ -1,34 +1,32 @@
-# LangGraph Orchestrator + Stateless Subagents Example
+# LangGraph Orchestrator + Stateless Subagents Example, v2.1
 
-This repo shows a production-oriented pattern for one orchestrator agent and three stateless subagents:
+This repo demonstrates a production-oriented pattern for one **orchestrator graph** and three **stateless subagents**:
 
 - `research_agent`
 - `coding_agent`
 - `writing_agent`
 
-The orchestrator owns the user-facing workflow thread. Subagents are stateless workers: they receive explicit task/context, return structured results, and do not own hidden conversation state.
+The orchestrator receives the user query, creates a route plan, validates it, applies policy, and hands off to one or more subagents. Subagents are workers: they receive explicit `AgentTask` input and return `AgentResult`. They do not own hidden workflow state.
 
-## Why this design
+## What v2 adds
 
-Core ideas:
+This version implements the 15 production-hardening items from the design review:
 
-1. **One thread per user-facing workflow session**
-   - The UI should create or reuse one `thread_id` for the active workflow/session.
-   - Follow-up turns use the same `thread_id`.
-
-2. **Subagents are stateless by default**
-   - They do not maintain private mutable state.
-   - They receive `AgentTask` and return `AgentResult`.
-
-3. **Routing is a reusable subsystem**
-   - Deterministic high-precision rules
-   - Optional LLM structured router boundary
-   - Route verifier
-   - Deterministic route policy gate
-
-4. **State is small; artifacts are stored externally**
-   - Graph state keeps artifact IDs and short control data.
-   - Full research summaries, code plans, drafts, and large outputs go into an artifact store.
+1. Cross-thread reference support through `referenced_thread_ids` and `referenced_artifact_ids`.
+2. Same-thread artifact usage: large outputs go to `ArtifactStore`; state carries IDs/summaries.
+3. Explicit identity model: `thread_id`, `run_id`, `handoff_id`, `task_id`, `agent_id`.
+4. Route plans, including `research_agent -> coding_agent` multi-step workflows.
+5. Separate verifier step before policy execution.
+6. Risk-aware routing thresholds.
+7. Golden and adversarial routing tests.
+8. Per-subagent context packaging through `build_agent_task`.
+9. Separate checkpoint state, artifact storage, and durable memory storage.
+10. Stateless subagent contract: `AgentTask -> AgentResult`.
+11. Clarification behavior distinct from fallback behavior.
+12. UI/session model documentation.
+13. Production persistence guidance.
+14. Structured observability events.
+15. Dynamic graph visualization guidance for `Command(goto=...)`.
 
 ## Project structure
 
@@ -41,6 +39,7 @@ src/orchestrator_agents/
     writing.py
   graph/
     build.py
+    context.py
     state.py
   routing/
     deterministic.py
@@ -50,11 +49,17 @@ src/orchestrator_agents/
     verifier.py
   storage/
     artifact_store.py
+    memory_store.py
+  observability.py
   cli.py
   registry.py
   schemas.py
 
 tests/
+  routing_cases/
+    adversarial_routes.json
+    golden_routes.json
+  test_artifact_memory.py
   test_graph_multiturn.py
   test_routing.py
 ```
@@ -73,13 +78,180 @@ pip install -e '.[dev]'
 orchestrator-demo
 ```
 
-The demo sends three turns through the same `thread_id`:
+The demo sends multiple turns through the same `thread_id`:
 
-1. Coding request
-2. Research request
-3. Writing request
+```text
+workflow_session_demo
+```
 
-The checkpointer preserves multi-turn state. The artifact store persists full outputs under `.artifacts/`.
+The same thread ID preserves active workflow context. The artifact store persists full outputs under `.artifacts/`.
+
+## Thread IDs in a UI application
+
+Use one `thread_id` per user-facing workflow/session:
+
+```json
+{
+  "thread_id": "workflow_session_abc123",
+  "user_query": "Build a LangGraph orchestrator"
+}
+```
+
+Reuse the same `thread_id` for follow-up turns:
+
+```json
+{
+  "thread_id": "workflow_session_abc123",
+  "user_query": "Now add a research step before coding"
+}
+```
+
+Create a new `thread_id` when the user starts a new independent workflow.
+
+### Referencing old sessions without resuming them
+
+Use a new `thread_id` plus references:
+
+```json
+{
+  "thread_id": "new_workflow_002",
+  "referenced_thread_ids": ["old_research_thread_001"],
+  "referenced_artifact_ids": ["artifact_abc123"]
+}
+```
+
+This imports curated artifact summaries from older work as read-only context. It does **not** load full old thread state, and it does **not** resume or mutate the old thread. Full artifact content remains in `ArtifactStore` and can be retrieved by ID only when a downstream agent truly needs it.
+
+## State vs artifacts vs memory
+
+Use graph state for active workflow control:
+
+```text
+selected_agent
+route_plan
+current_route_step_index
+route_history
+handoff_history
+artifact_ids
+short summaries
+```
+
+Use `ArtifactStore` for large or reusable generated outputs:
+
+```text
+research summaries
+coding plans
+drafts
+reports
+backtest outputs
+```
+
+Use `MemoryStore` for durable knowledge across threads:
+
+```text
+user preferences
+project facts
+agent-specific reusable facts
+```
+
+Production pattern:
+
+```text
+full output -> ArtifactStore
+state -> artifact_id + short summary
+subagent -> retrieve artifact only when needed
+```
+
+## Routing control plane
+
+`RoutingService.decide_plan()` runs:
+
+```text
+deterministic_route_plan
+  ↓ if no match
+llm_route_plan
+  ↓
+verify_route_plan
+  ↓
+apply_route_plan_policy
+```
+
+The router proposes. The policy gate decides.
+
+The LLM router is intentionally mocked so the repo runs without credentials. Replace `llm_route_plan()` with structured output from your model provider:
+
+```python
+router = llm.with_structured_output(RoutePlan)
+plan = router.invoke([
+    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+    {"role": "user", "content": user_query},
+])
+```
+
+## Route plans
+
+A single-agent route:
+
+```text
+orchestrator -> coding_agent -> finalizer
+```
+
+A multi-agent route:
+
+```text
+orchestrator -> research_agent -> coding_agent -> finalizer
+```
+
+Example query:
+
+```text
+Find the latest LangGraph handoff docs and build a Python routing example
+```
+
+This routes to research first, then coding.
+
+## Clarification vs fallback
+
+Clarification means the system needs more user input:
+
+```text
+"Can you help with my agent?" -> clarification_node
+```
+
+Fallback means no specialist fits but the request is answerable:
+
+```text
+"What is 2 + 2?" -> fallback_agent
+```
+
+## Dynamic graph visualization
+
+The graph uses `Command(goto=...)` for runtime handoffs. Some graph renderers may show agent nodes as disconnected or may not draw every possible runtime handoff as a static edge. That can be correct.
+
+The dynamic handoff happens in `route_policy_node` and `next_step_node`.
+
+Use typed `Command` destinations and route history/observability events to make runtime behavior auditable.
+
+## Production persistence guidance
+
+Demo:
+
+```text
+InMemorySaver
+JsonArtifactStore
+JsonMemoryStore
+```
+
+Production:
+
+```text
+Postgres/Redis/durable checkpointer
+S3/blob/document store for artifacts
+database/vector store for memory
+LangSmith/OpenTelemetry for tracing
+```
+
+In-memory checkpointing is not durable across process restarts.
 
 ## Run tests
 
@@ -87,53 +259,15 @@ The checkpointer preserves multi-turn state. The artifact store persists full ou
 pytest
 ```
 
-## How routing works
+Tests cover:
 
-`RoutingService.decide()` performs:
+- golden routing cases
+- adversarial routing cases
+- clarification vs fallback
+- route plans
+- artifact/memory separation
+- multi-turn graph behavior when LangGraph is installed
 
-```text
-deterministic_route
-  ↓ if no match
-llm_route
-  ↓
-verify_route
-  ↓
-apply_route_policy
-```
+## Design rule
 
-The LLM router is intentionally mocked so the repo runs without provider credentials. Replace `llm_route()` with your model provider using structured output:
-
-```python
-router = llm.with_structured_output(RouteDecision)
-decision = router.invoke([
-    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-    {"role": "user", "content": user_query},
-])
-```
-
-## Thread ID guidance
-
-Use the same `thread_id` for the same user-facing workflow/session:
-
-```python
-config = {"configurable": {"thread_id": "workflow_session_123"}}
-```
-
-Create a new `thread_id` when the user starts a new independent workflow. If the new workflow should reference prior work, store the prior work as artifacts and pass artifact IDs into the new workflow rather than reusing the old checkpoint state directly.
-
-## Production upgrades
-
-For production, replace:
-
-- `InMemorySaver` with a persistent checkpointer such as Postgres/Redis/SQLite depending on your deployment.
-- `JsonArtifactStore` with Postgres, S3/blob storage, or a document store.
-- Mock `llm_route()` with a real structured-output LLM router.
-- Mock subagents with real specialist agents/tools.
-- Add LangSmith/OpenTelemetry tracing.
-- Add golden routing tests and adversarial routing tests in CI.
-
-## Important design rule
-
-The router proposes. The policy gate decides.
-
-Do not let an LLM route directly to a subagent without deterministic policy checks, confidence thresholds, ambiguity checks, and verification.
+Subagents are stateless by default. The orchestrator owns active thread state. Durable knowledge goes into memory/artifact stores.

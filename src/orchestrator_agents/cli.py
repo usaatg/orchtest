@@ -9,55 +9,69 @@ except Exception:  # pragma: no cover
     InMemorySaver = None  # type: ignore[assignment]
 
 from orchestrator_agents.graph import build_orchestrator_graph
-from orchestrator_agents.storage.artifact_store import JsonArtifactStore
+from orchestrator_agents.storage import JsonArtifactStore, JsonMemoryStore
 
 
 def main() -> None:
-    """Run a tiny multi-turn demo using one stable thread_id."""
-
     if InMemorySaver is None:
-        raise RuntimeError(
-            "LangGraph is not installed. Run: pip install -e '.[dev]'"
-        )
+        raise RuntimeError("Install dependencies first: pip install -e '.[dev]'")
 
     user_id = "demo_user"
-    thread_id = f"thread_{uuid4().hex[:8]}"
-    checkpointer = InMemorySaver()
+    thread_id = "workflow_session_demo"
     artifact_store = JsonArtifactStore(Path(".artifacts"))
-    graph = build_orchestrator_graph(checkpointer=checkpointer, artifact_store=artifact_store)
+    memory_store = JsonMemoryStore(Path(".memory"))
+    memory_store.put(
+        user_id=user_id,
+        namespace=("users", user_id, "memories"),
+        memory_type="preference",
+        content="User prefers production-grade Python examples.",
+    )
 
-    config = {"configurable": {"thread_id": thread_id}}
+    graph = build_orchestrator_graph(
+        checkpointer=InMemorySaver(),
+        artifact_store=artifact_store,
+    )
+    config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
 
     turns = [
-        "Can you create a LangGraph orchestrator codebase with subagents?",
-        "Now research the latest docs first before coding next time.",
-        "Rewrite the final explanation in a more executive tone.",
+        "Find the latest LangGraph handoff docs and build a Python routing example",
+        "Rewrite that explanation clearly for a technical stakeholder",
+        "Can you help with this thing?",
     ]
 
+    state = None
     for i, query in enumerate(turns, start=1):
-        result = graph.invoke(
+        print(f"\n--- Turn {i}: {query}")
+        state = graph.invoke(
             {
                 "user_query": query,
                 "user_id": user_id,
                 "thread_id": thread_id,
+                "run_id": f"run_{uuid4().hex[:12]}",
                 "messages": [],
                 "route_history": [],
                 "handoff_history": [],
+                "observability_events": [],
+                "agent_results": [],
                 "artifact_ids": [],
+                "imported_context": [],
+                "referenced_thread_ids": [],
+                "referenced_artifact_ids": [],
             },
             config=config,
         )
-        print("=" * 80)
-        print(f"TURN {i}")
-        print(f"thread_id: {thread_id}")
-        print(result["final_answer"])
-        print(f"artifact_ids: {result.get('artifact_ids', [])}")
+        print(f"selected_agent: {state.get('selected_agent')}")
+        print(f"final_answer:\n{state.get('final_answer')}\n")
 
-    snapshot = graph.get_state(config)
-    print("=" * 80)
-    print("LATEST CHECKPOINT KEYS")
-    print(sorted(snapshot.values.keys()))
-    print(f"Total route events: {len(snapshot.values.get('route_history', []))}")
+    if state:
+        print("--- Route history")
+        for event in state.get("route_history", []):
+            print(event)
+        print("--- Handoff history")
+        for event in state.get("handoff_history", []):
+            print(event)
+        print("--- Artifact IDs")
+        print(state.get("artifact_ids", []))
 
 
 if __name__ == "__main__":

@@ -9,8 +9,8 @@ from orchestrator_agents.storage.artifact_store import JsonArtifactStore
 class StatelessSubAgent(ABC):
     """Base class for stateless subagents.
 
-    The subagent receives explicit task/context and returns structured output.
-    It does not own hidden conversation state. The orchestrator graph owns thread state.
+    Subagents receive explicit AgentTask/context and return AgentResult. They should not own
+    hidden mutable workflow state. The orchestrator graph/checkpointer owns thread state.
     """
 
     name: str

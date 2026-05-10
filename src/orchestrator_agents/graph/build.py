@@ -3,13 +3,26 @@ from __future__ import annotations
 from uuid import uuid4
 from typing import Literal
 
-from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
+try:
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command
+except Exception:  # pragma: no cover - lets non-LangGraph tests import package
+    END = "__end__"  # type: ignore[assignment]
+    START = "__start__"  # type: ignore[assignment]
+    StateGraph = None  # type: ignore[assignment]
+
+    class Command(dict):  # type: ignore[no-redef]
+        def __init__(self, update=None, goto=None):
+            super().__init__(update=update or {}, goto=goto)
+            self.update = update or {}
+            self.goto = goto
 
 from orchestrator_agents.agents import CodingAgent, ResearchAgent, WritingAgent
+from orchestrator_agents.graph.context import build_agent_task
 from orchestrator_agents.graph.state import OrchestratorState
+from orchestrator_agents.observability import make_event
 from orchestrator_agents.routing import RoutingService
-from orchestrator_agents.schemas import AgentTask, RouteDecision, RouteVerification
+from orchestrator_agents.schemas import HandoffEvent, ImportedContext, RoutePlan, RouteVerification
 from orchestrator_agents.storage.artifact_store import JsonArtifactStore
 
 DestinationLiteral = Literal[
@@ -18,185 +31,315 @@ DestinationLiteral = Literal[
     "writing_agent",
     "clarification_node",
     "fallback_agent",
+    "finalizer",
 ]
 
 
-def build_orchestrator_graph(
-    *,
-    artifact_store: JsonArtifactStore | None = None,
-    routing_service: RoutingService | None = None,
-    checkpointer=None,
-):
+def build_orchestrator_graph(*, checkpointer=None, artifact_store: JsonArtifactStore | None = None):
     """Build the orchestrator graph.
 
-    Subagents are stateless workers. The graph thread/checkpointer owns workflow
-    continuity. The artifact store owns durable large outputs.
+    Runtime handoffs use Command(goto=...). Some visual graph renderers may not show these
+    dynamic edges as static arrows; see README for details.
     """
 
+    if StateGraph is None:  # pragma: no cover
+        raise RuntimeError("langgraph is required to build the graph")
+
     artifact_store = artifact_store or JsonArtifactStore()
-    routing_service = routing_service or RoutingService()
+    routing_service = RoutingService()
+    agents = {
+        "research_agent": ResearchAgent(),
+        "coding_agent": CodingAgent(),
+        "writing_agent": WritingAgent(),
+    }
 
-    research = ResearchAgent()
-    coding = CodingAgent()
-    writing = WritingAgent()
-
-    def start_turn_node(state: OrchestratorState) -> dict:
-        run_id = f"run_{uuid4().hex[:12]}"
-        user_message = {"role": "user", "content": state["user_query"], "run_id": run_id}
+    def initialize_node(state: OrchestratorState) -> dict:
+        run_id = state.get("run_id") or f"run_{uuid4().hex[:12]}"
+        query = state["user_query"].strip()
         return {
             "run_id": run_id,
-            "messages": [user_message],
+            "normalized_query": query,
+            "current_route_step_index": 0,
+            # Reset turn-scoped terminal output so checkpointed multi-turn sessions
+            # do not keep returning a prior turn's final_answer.
+            "final_answer": "",
             "route_history": [
-                {
-                    "stage": "start_turn",
-                    "run_id": run_id,
-                    "thread_id": state["thread_id"],
-                    "user_query": state["user_query"],
-                }
+                {"stage": "normalize_request", "normalized_query": query, "run_id": run_id}
+            ],
+            "observability_events": [
+                make_event(
+                    event_type="request_normalized",
+                    thread_id=state["thread_id"],
+                    run_id=run_id,
+                    payload={"query_length": len(query)},
+                )
             ],
         }
 
-    def route_node(state: OrchestratorState) -> Command[DestinationLiteral]:
-        decision, verification, destination = routing_service.decide(state["user_query"])
+    def import_context_node(state: OrchestratorState) -> dict:
+        imported: list[dict] = []
+        user_id = state["user_id"]
 
-        handoff_event = {
-            "handoff_id": f"handoff_{uuid4().hex[:12]}",
-            "run_id": state["run_id"],
-            "thread_id": state["thread_id"],
-            "from_agent": "orchestrator",
-            "to_agent": destination,
-            "primary_intent": decision.primary_intent,
-            "confidence": decision.confidence,
-            "reason": decision.reasoning_summary,
+        for artifact_id in state.get("referenced_artifact_ids", []):
+            record = artifact_store.get_any_for_user(user_id=user_id, artifact_id=artifact_id)
+            if record:
+                imported.append(
+                    ImportedContext(
+                        source_thread_id=record.source_thread_id,
+                        source_artifact_id=record.artifact_id,
+                        # Import curated summaries into graph state, not full artifact content.
+                        # Downstream agents can load full content by artifact ID if needed.
+                        content=record.summary,
+                        summary=record.summary,
+                        metadata={**record.metadata, "artifact_type": record.artifact_type, "full_content_in_store": True},
+                    ).model_dump()
+                )
+
+        # Thread references are read-only. We import summaries from that thread's artifacts.
+        for source_thread_id in state.get("referenced_thread_ids", []):
+            for record in artifact_store.list_for_thread(user_id=user_id, thread_id=source_thread_id):
+                imported.append(
+                    ImportedContext(
+                        source_thread_id=source_thread_id,
+                        source_artifact_id=record.artifact_id,
+                        # Import curated summaries into graph state, not full artifact content.
+                        # Downstream agents can load full content by artifact ID if needed.
+                        content=record.summary,
+                        summary=record.summary,
+                        metadata={**record.metadata, "artifact_type": record.artifact_type, "full_content_in_store": True},
+                    ).model_dump()
+                )
+
+        return {
+            "imported_context": imported,
+            "observability_events": [
+                make_event(
+                    event_type="context_imported",
+                    thread_id=state["thread_id"],
+                    run_id=state["run_id"],
+                    payload={"count": len(imported)},
+                )
+            ],
         }
 
-        update = {
-            "selected_agent": destination,
-            "current_agent": destination,
-            "route_decision": decision.model_dump(),
+    def route_node(state: OrchestratorState) -> dict:
+        plan, verification, destination, policy_reason = routing_service.decide_plan(
+            state["normalized_query"], state=state
+        )
+        return {
+            "route_plan": plan.model_dump(),
             "route_verification": verification.model_dump(),
-            "handoff_history": [handoff_event],
+            "selected_agent": destination,
+            "route_policy_reason": policy_reason,
             "route_history": [
                 {
-                    "stage": "route_policy",
-                    "run_id": state["run_id"],
-                    "target_agent": decision.target_agent,
+                    "stage": "route_policy_gate",
+                    "mode": plan.mode,
                     "selected_agent": destination,
-                    "confidence": decision.confidence,
-                    "ambiguity_score": decision.ambiguity_score,
-                    "verification_approved": verification.approved,
+                    "confidence": plan.confidence,
+                    "ambiguity_score": plan.ambiguity_score,
+                    "reason": policy_reason,
                 }
+            ],
+            "observability_events": [
+                make_event(
+                    event_type="route_selected",
+                    thread_id=state["thread_id"],
+                    run_id=state["run_id"],
+                    agent_id=destination,
+                    payload={
+                        "mode": plan.mode,
+                        "confidence": plan.confidence,
+                        "policy_reason": policy_reason,
+                        "verification": verification.model_dump(),
+                    },
+                )
             ],
         }
 
-        if destination == "clarification_node":
-            update["clarification_question"] = (
-                decision.clarification_question
-                or "Can you clarify whether this is research, coding, or writing?"
-            )
+    def route_policy_node(state: OrchestratorState) -> Command[DestinationLiteral]:
+        selected = state["selected_agent"]
+        plan = RoutePlan.model_validate(state["route_plan"])
+        verification = RouteVerification.model_validate(state["route_verification"])
 
-        return Command(update=update, goto=destination)
+        if selected in {"clarification_node", "fallback_agent"}:
+            return Command(update={"current_agent": selected}, goto=selected)
 
-    def _build_task(state: OrchestratorState, target_agent: str) -> AgentTask:
-        return AgentTask(
-            task_id=f"task_{uuid4().hex[:12]}",
-            target_agent=target_agent,  # type: ignore[arg-type]
-            user_query=state["user_query"],
-            instruction=state["user_query"],
-            context={
-                "user_id": state["user_id"],
-                "thread_id": state["thread_id"],
-                "run_id": state["run_id"],
-                # Pass references, not huge blobs. Agents can retrieve artifacts if needed.
-                "available_artifact_ids": state.get("artifact_ids", []),
-                "route_decision": state.get("route_decision", {}),
+        handoff_id = f"handoff_{uuid4().hex[:12]}"
+        first_step = plan.steps[0]
+        event = HandoffEvent(
+            handoff_id=handoff_id,
+            thread_id=state["thread_id"],
+            run_id=state["run_id"],
+            from_agent="orchestrator",
+            to_agent=selected,  # type: ignore[arg-type]
+            task_id=first_step.step_id,
+            confidence=plan.confidence,
+            reason=state.get("route_policy_reason") or verification.reason,
+        )
+        return Command(
+            update={
+                "current_agent": selected,
+                "current_route_step_index": 0,
+                "handoff_history": [event.model_dump()],
+                "observability_events": [
+                    make_event(
+                        event_type="handoff_created",
+                        thread_id=state["thread_id"],
+                        run_id=state["run_id"],
+                        agent_id=selected,
+                        task_id=first_step.step_id,
+                        handoff_id=handoff_id,
+                        payload={"from_agent": "orchestrator", "to_agent": selected},
+                    )
+                ],
             },
+            goto=selected,
         )
 
-    def research_agent_node(state: OrchestratorState) -> dict:
-        result = research.invoke(_build_task(state, "research_agent"), artifact_store)
-        return _agent_result_update(result)
+    def make_agent_node(agent_name: str):
+        def _agent_node(state: OrchestratorState) -> dict:
+            task = build_agent_task(agent_name, state)
+            result = agents[agent_name].invoke(task, artifact_store)
+            return {
+                "latest_agent_result": result.model_dump(),
+                "agent_results": [result.model_dump()],
+                "artifact_ids": result.artifact_ids,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "name": agent_name,
+                        "content": result.result_summary,
+                    }
+                ],
+                "observability_events": [
+                    make_event(
+                        event_type="subagent_completed",
+                        thread_id=state["thread_id"],
+                        run_id=state["run_id"],
+                        agent_id=agent_name,
+                        task_id=task.task_id,
+                        payload={
+                            "confidence": result.confidence,
+                            "artifact_ids": result.artifact_ids,
+                            "used_context_keys": result.metadata.get("used_context_keys", []),
+                        },
+                    )
+                ],
+            }
 
-    def coding_agent_node(state: OrchestratorState) -> dict:
-        result = coding.invoke(_build_task(state, "coding_agent"), artifact_store)
-        return _agent_result_update(result)
+        return _agent_node
 
-    def writing_agent_node(state: OrchestratorState) -> dict:
-        result = writing.invoke(_build_task(state, "writing_agent"), artifact_store)
-        return _agent_result_update(result)
+    def next_step_node(state: OrchestratorState) -> Command[DestinationLiteral]:
+        plan = RoutePlan.model_validate(state["route_plan"])
+        current_index = state.get("current_route_step_index", 0)
+        next_index = current_index + 1
 
-    def _agent_result_update(result) -> dict:
-        return {
-            "agent_result": result.result,
-            "artifact_ids": result.artifact_ids,
-            "messages": [
-                {
-                    "role": "assistant",
-                    "name": result.agent_name,
-                    "content": result.result,
-                    "task_id": result.task_id,
-                }
-            ],
-            "route_history": [
-                {
-                    "stage": "subagent_completed",
-                    "agent_name": result.agent_name,
-                    "task_id": result.task_id,
-                    "confidence": result.confidence,
-                    "artifact_ids": result.artifact_ids,
-                }
-            ],
-        }
+        if plan.mode != "multi_agent" or next_index >= len(plan.steps):
+            return Command(update={"current_agent": "finalizer"}, goto="finalizer")
+
+        next_step = plan.steps[next_index]
+        selected = next_step.agent
+        handoff_id = f"handoff_{uuid4().hex[:12]}"
+        event = HandoffEvent(
+            handoff_id=handoff_id,
+            thread_id=state["thread_id"],
+            run_id=state["run_id"],
+            from_agent=state.get("current_agent", "orchestrator"),
+            to_agent=selected,
+            task_id=next_step.step_id,
+            confidence=plan.confidence,
+            reason="Sequential route-plan step.",
+        )
+        return Command(
+            update={
+                "selected_agent": selected,
+                "current_agent": selected,
+                "current_route_step_index": next_index,
+                "handoff_history": [event.model_dump()],
+                "observability_events": [
+                    make_event(
+                        event_type="handoff_created",
+                        thread_id=state["thread_id"],
+                        run_id=state["run_id"],
+                        agent_id=selected,
+                        task_id=next_step.step_id,
+                        handoff_id=handoff_id,
+                        payload={"route_step_index": next_index},
+                    )
+                ],
+            },
+            goto=selected,
+        )
 
     def clarification_node(state: OrchestratorState) -> dict:
-        question = state.get(
-            "clarification_question",
-            "Can you clarify whether you want research, coding, or writing help?",
-        )
+        plan = RoutePlan.model_validate(state["route_plan"])
+        answer = plan.clarification_question or "Can you clarify what kind of help you want?"
         return {
-            "final_answer": question,
-            "messages": [{"role": "assistant", "name": "orchestrator", "content": question}],
+            "final_answer": answer,
+            "messages": [{"role": "assistant", "name": "clarification_node", "content": answer}],
         }
 
-    def fallback_agent_node(state: OrchestratorState) -> dict:
+    def fallback_agent(state: OrchestratorState) -> dict:
         answer = (
-            "I could not confidently route this request to research, coding, or writing. "
-            "Please clarify the goal or add more task details."
+            "I can handle this as a general request, but no specialist subagent was selected. "
+            f"Policy reason: {state.get('route_policy_reason', 'No specialist route matched.')}"
         )
         return {
-            "agent_result": answer,
+            "final_answer": answer,
+            "latest_agent_result": {"agent_name": "fallback_agent", "result_summary": answer},
+            "agent_results": [
+                {
+                    "task_id": "fallback",
+                    "agent_name": "fallback_agent",
+                    "result": answer,
+                    "result_summary": answer,
+                    "confidence": 0.5,
+                    "artifact_ids": [],
+                    "needs_followup": False,
+                    "metadata": {},
+                }
+            ],
             "messages": [{"role": "assistant", "name": "fallback_agent", "content": answer}],
         }
 
     def finalizer_node(state: OrchestratorState) -> dict:
         if state.get("final_answer"):
             return {}
-
-        selected = state.get("selected_agent", "unknown")
-        result = state.get("agent_result", "No result was produced.")
-        final = f"Handled by `{selected}`.\n\n{result}"
+        results = state.get("agent_results", [])
+        if not results:
+            answer = "No specialist result was produced."
+        else:
+            parts = [r.get("result", r.get("result_summary", "")) for r in results[-3:]]
+            answer = "\n\n".join(parts)
         return {
-            "final_answer": final,
-            "messages": [{"role": "assistant", "name": "finalizer", "content": final}],
+            "final_answer": answer,
+            "messages": [{"role": "assistant", "name": "finalizer", "content": answer}],
         }
 
     builder = StateGraph(OrchestratorState)
-    builder.add_node("start_turn", start_turn_node)
+    builder.add_node("initialize", initialize_node)
+    builder.add_node("import_context", import_context_node)
     builder.add_node("route", route_node)
-    builder.add_node("research_agent", research_agent_node)
-    builder.add_node("coding_agent", coding_agent_node)
-    builder.add_node("writing_agent", writing_agent_node)
+    builder.add_node("route_policy", route_policy_node)
+    builder.add_node("research_agent", make_agent_node("research_agent"))
+    builder.add_node("coding_agent", make_agent_node("coding_agent"))
+    builder.add_node("writing_agent", make_agent_node("writing_agent"))
+    builder.add_node("next_step", next_step_node)
     builder.add_node("clarification_node", clarification_node)
-    builder.add_node("fallback_agent", fallback_agent_node)
+    builder.add_node("fallback_agent", fallback_agent)
     builder.add_node("finalizer", finalizer_node)
 
-    builder.add_edge(START, "start_turn")
-    builder.add_edge("start_turn", "route")
+    builder.add_edge(START, "initialize")
+    builder.add_edge("initialize", "import_context")
+    builder.add_edge("import_context", "route")
+    builder.add_edge("route", "route_policy")
 
-    for agent in ["research_agent", "coding_agent", "writing_agent", "fallback_agent"]:
-        builder.add_edge(agent, "finalizer")
-
+    builder.add_edge("research_agent", "next_step")
+    builder.add_edge("coding_agent", "next_step")
+    builder.add_edge("writing_agent", "next_step")
+    builder.add_edge("fallback_agent", "finalizer")
     builder.add_edge("clarification_node", END)
     builder.add_edge("finalizer", END)
 
-    return builder.compile(checkpointer=checkpointer) if checkpointer else builder.compile()
+    return builder.compile(checkpointer=checkpointer)
