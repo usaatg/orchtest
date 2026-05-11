@@ -1,6 +1,6 @@
 [project]
 name = "orchestrator-subagents-example"
-version = "0.4.0"
+version = "0.5.0"
 description = "Production-oriented LangGraph orchestrator with direct-callable LangGraph subagent workflows, smart form building, problem statements, artifact lineage, dependencies, memory, and routing tests."
 requires-python = ">=3.11"
 dependencies = [

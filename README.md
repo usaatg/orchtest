@@ -2,6 +2,90 @@
 
 This repository demonstrates a production-oriented **LangGraph orchestrator** that routes user requests to multiple **LangGraph subagent workflows**. The design is intended for teams building agentic systems where a central orchestrator controls routing, session state, artifact lineage, dependency invalidation, and final user-facing responses, while specialized agents can also be used independently.
 
+
+## Version 5 update: agent modules now own their LangGraph workflows
+
+Version 5 moves the key multi-step agent workflows into the agent modules themselves:
+
+- `src/orchestrator_agents/agents/smart_form.py` now defines `SmartFormBuilderAgent` **and** the multi-node `build_smart_form_builder_agent_graph(...)` workflow.
+- `src/orchestrator_agents/agents/problem_statement.py` now defines `ProblemStatementAgent` **and** the multi-node `build_problem_statement_agent_graph(...)` workflow.
+- `src/orchestrator_agents/agent_workflows/smart_form.py` and `problem_statement.py` remain as compatibility re-export modules for older imports.
+
+This means the agents can be used in both ways:
+
+```python
+from orchestrator_agents.agents.smart_form import SmartFormBuilderAgent, DEFAULT_PROBLEM_FORM_SCHEMA
+from orchestrator_agents.schemas import FormAgentInput
+
+agent = SmartFormBuilderAgent()
+output = agent.run(
+    FormAgentInput(
+        user_message="I want to define a problem",
+        form_schema=DEFAULT_PROBLEM_FORM_SCHEMA,
+    )
+)
+
+# Direct invoke is also supported.
+output = agent.invoke(
+    FormAgentInput(
+        user_message="Plant managers",
+        form_schema=DEFAULT_PROBLEM_FORM_SCHEMA,
+        form_state=output.updated_form_state,
+    )
+)
+```
+
+And as orchestrator subagents:
+
+```python
+from orchestrator_agents.schemas import AgentTask
+from orchestrator_agents.storage.artifact_store import JsonArtifactStore
+
+store = JsonArtifactStore()
+result = agent.invoke(
+    AgentTask(
+        task_id="form_step_1",
+        target_agent="smart_form_builder_agent",
+        user_query="I want to define a problem",
+        instruction="Continue the smart form workflow",
+        context={"user_id": "u1", "thread_id": "t1"},
+    ),
+    artifact_store=store,
+)
+```
+
+### Smart Form Builder graph nodes
+
+The Smart Form Builder graph is no longer just a service wrapper. It is a real multi-node workflow:
+
+```text
+START
+  -> normalize_input
+  -> apply_user_message
+  -> validate_form
+  -> produce_form_output
+  -> persist_completed_form
+  -> build_agent_result
+  -> END
+```
+
+### Problem Statement graph nodes
+
+The Problem Statement graph is also a real multi-node workflow:
+
+```text
+START
+  -> resolve_form_context
+  -> draft_problem_statement
+  -> validate_problem_statement
+  -> produce_problem_output
+  -> persist_problem_statement
+  -> build_agent_result
+  -> END
+```
+
+The direct `.run(...)` and `.invoke(...)` methods execute the graph when LangGraph is installed. In minimal local test environments where LangGraph is not installed, they execute the same node pipeline synchronously so the typed agent contract remains usable.
+
 ## Audience
 
 This README is written for three audiences:
