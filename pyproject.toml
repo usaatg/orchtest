@@ -1,32 +1,18 @@
 [project]
-name = "orchestrator-subagents-example"
-version = "0.5.0"
-description = "Production-oriented LangGraph orchestrator with direct-callable LangGraph subagent workflows, smart form building, problem statements, artifact lineage, dependencies, memory, and routing tests."
+name = "langgraph-router-subagents-uuid"
+version = "0.1.0"
+description = "LangGraph router with deterministic UUIDv5 subagent thread IDs derived from a router thread ID."
 requires-python = ">=3.11"
 dependencies = [
-  "langgraph>=0.2.60",
-  "langchain-core>=0.3.0",
-  "pydantic>=2.7.0",
-  "typing-extensions>=4.10.0",
+    "langgraph>=0.2.60",
+    "langchain-core>=0.3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.0.0",
-  "ruff>=0.6.0",
+    "pytest>=8.0.0",
 ]
-
-[project.scripts]
-orchestrator-demo = "orchestrator_agents.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-
-[tool.ruff]
-line-length = 100
-src = ["src", "tests"]
-
-[build-system]
-requires = ["setuptools>=69", "wheel"]
-build-backend = "setuptools.build_meta"
